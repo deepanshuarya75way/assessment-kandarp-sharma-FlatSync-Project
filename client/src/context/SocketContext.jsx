@@ -13,12 +13,13 @@ export const SocketProvider = ({ children }) => {
 
   useEffect(() => {
     if (isAuthenticated && user) {
-
+      const token = localStorage.getItem('token');
       const backendUrl = (import.meta.env.VITE_API_URL || 'http://localhost:5000/api').replace(/\/api\/?$/, '');
       const newSocket = io(backendUrl, {
-        query: { userId: user._id },
+        auth: {token},
         withCredentials: true,
         transports: ['websocket', 'polling'],
+        reconnection: true,
       });
 
       newSocket.on('connect', () => {

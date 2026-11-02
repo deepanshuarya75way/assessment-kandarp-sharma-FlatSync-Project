@@ -1,8 +1,12 @@
 const { Server } = require('socket.io');
+const jwt = require('jsonwebtoken');
+const User = require('./models/User');
 const Message = require('./models/Message');
 
 let io;
 const onlineUsers = new Map(); // userId -> socketId
+
+const getOnlineUserIds = () => Array.from(onlineUsers.keys());
 
 const initSocket = (server) => {
   const allowedOrigins = [
@@ -25,21 +29,64 @@ const initSocket = (server) => {
     },
   });
 
-  io.on('connection', (socket) => {
-    const userId = socket.handshake.query.userId;
+  io.use(async(socket, next)=>{
+    try{
+      const token = socket.handshake.auth?.token;
 
-    if (userId && userId !== 'undefined') {
-      onlineUsers.set(userId, socket.id);
+      if(!token){
+        return next(new Error('Authentication required'));
+      }
 
-      // Tell everyone this user is now online
-      io.emit('user_online', userId);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-      // Send full online list to the newly connected user
-      socket.emit('online_users_list', Array.from(onlineUsers.keys()));
+      const user = await User.findById(decoded.id).select('_id');
 
-      console.log(`✅ Online: ${userId}`);
-      console.log(`🗺 Online users:`, Array.from(onlineUsers.keys()));
+      if(!user){
+        return next(new Error('User not Found'));
+      }
+
+      socket.data.userId = user._id.toString();
+      next();
+    } catch(error){
+      next(new Error('Invalid authentication token'));
     }
+  });
+
+  io.on('connection', (socket) => {
+    const userId = socket.data.userId;
+
+    let sockets = onlineUsers.get(userId);
+
+    const wasOffline = !sockets || sockets.size === 0;
+
+    if(!sockets){
+      sockets = new Set();
+      onlineUsers.set(userId, sockets);
+    }
+
+    sockets.add(socket.id);
+
+    socket.join("user:" + userId);
+
+    if(wasOffline){
+      io.emit('user_online', userId);
+    }
+    socket.emit('online_users_list', getOnlineUserIds());
+
+    console.log(`Online: ${userId}, connections: ${sockets.size}`);
+
+    // if (userId && userId !== 'undefined') {
+    //   onlineUsers.set(userId, socket.id);
+
+    //   // Tell everyone this user is now online
+    //   io.emit('user_online', userId);
+
+    //   // Send full online list to the newly connected user
+    //   socket.emit('online_users_list', Array.from(onlineUsers.keys()));
+
+      // console.log(`✅ Online: ${userId}`);
+      // console.log(`🗺 Online users:`, Array.from(onlineUsers.keys()));
+    // }
 
     // When user opens chat page — send fresh online list to entire room
     socket.on('join_room', (roomId) => {
@@ -47,7 +94,7 @@ const initSocket = (server) => {
       console.log(`🚪 ${userId} joined room: ${roomId}`);
 
       // ✅ Both users in the room get the fresh online list
-      io.to(roomId).emit('online_users_list', Array.from(onlineUsers.keys()));
+      io.to(roomId).emit('online_users_list',getOnlineUserIds());
     });
 
     // Send message — save to DB then emit to room
@@ -55,7 +102,7 @@ const initSocket = (server) => {
       try {
         const saved = await Message.create({
           roomId:     data.roomId,
-          senderId:   data.senderId,
+          senderId:   userId,
           receiverId: data.receiverId,
           text:       data.text,
         });
@@ -66,16 +113,27 @@ const initSocket = (server) => {
 
         io.to(data.roomId).emit('receive_message', populated);
 
-        const receiverSocketId = onlineUsers.get(data.receiverId);
-        if (receiverSocketId) {
-          io.to(receiverSocketId).emit('new_message_notification', {
-            roomId:     data.roomId,
-            senderId:   data.senderId,
+        // const receiverSocketId = onlineUsers.get(data.receiverId);
+        // if (receiverSocketId) {
+        //   io.to(receiverSocketId).emit('new_message_notification', {
+        //     roomId:     data.roomId,
+        //     senderId:   data.senderId,
+        //     senderName: populated.senderId.name,
+        //     text:       data.text.length > 40
+        //                   ? data.text.substring(0, 40) + '...'
+        //                   : data.text,
+        //   });
+        // }
+
+        const receiverId = String(data.receiverId);
+
+        if(onlineUsers.has(receiverId)){
+          io.to(`user:${receiverId}`).emit('new_message_notification', {
+            roomId : data.roomId,
+            senderId: userId,
             senderName: populated.senderId.name,
-            text:       data.text.length > 40
-                          ? data.text.substring(0, 40) + '...'
-                          : data.text,
-          });
+            text: data.text.length > 40 ? data.text.substring(0, 40) + '...' : data.text,
+          })
         }
 
         console.log(`💬 [${data.roomId}]: ${data.text}`);
@@ -112,18 +170,32 @@ const initSocket = (server) => {
 
     // Flatmate request notification
     socket.on('request_notification', ({ toUserId, notification }) => {
-      const sid = onlineUsers.get(toUserId);
-      if (sid) io.to(sid).emit('incoming_request', notification);
+      // const sid = onlineUsers.get(toUserId);
+      // if (sid) io.to(sid).emit('incoming_request', notification);
+
+      const receiverId = Sting(toUserId);
+
+      if(onlineUsers.has(receiverId)){
+        io.to(`user:${receiverId}`).emit('incoming_request', notification);
+      }
     });
 
     // Disconnect — remove from Map and broadcast offline
     socket.on('disconnect', () => {
-      if (userId) {
-        onlineUsers.delete(userId);
-        io.emit('user_offline', userId);
-        console.log(`❌ Offline: ${userId}`);
-        console.log(`🗺 Online users:`, Array.from(onlineUsers.keys()));
+      const sockets = onlineUsers.get(userId);
+      if(!sockets){
+        return;
       }
+      sockets.delete(socket.id);
+
+      if(sockets.size > 0){
+        console.log(`User ${userId} still online: ${sockets.size} connections`);
+        return;
+      }
+
+      onlineUsers.delete(userId);
+      io.emit('user_offine', userId);
+      console.log(`Offline: ${userId}`);
     });
   });
 };
